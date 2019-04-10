@@ -8,7 +8,7 @@ Python client for [sonic](https://github.com/valeriansaliou/sonic) search backen
 
 ```python
 def test_ingest():
-    with IngestClient("127.0.0.1", '1491', 'dmdm') as ingestcl:
+    with IngestClient("127.0.0.1", 1491, 'dmdm') as ingestcl:
         print(ingestcl.ping())
         print(ingestcl.protocol)
         print(ingestcl.bufsize)
@@ -27,7 +27,7 @@ def test_ingest():
 
 ```python
 def test_search():
-    with SearchClient("127.0.0.1", '1491', 'dmdm') as querycl:
+    with SearchClient("127.0.0.1", 1491, 'dmdm') as querycl:
         print(querycl.ping())
         print(querycl.query("wiki", "articles", "for"))
         print(querycl.query("wiki", "articles", "love"))
@@ -37,4 +37,4 @@ def test_search():
 
 
 ## Difference from asonic
-The project is using socket module to communicate with sonic server, while asonic is built around asyncio, which doesn't work well with gevent context.  
+asonic uses asyncio and this client doesn't. It grew out of needing to use sonic within gevent context  
