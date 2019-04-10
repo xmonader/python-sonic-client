@@ -57,7 +57,6 @@ def is_error(response):
 
 
 def raise_for_error(response):
-    print("checking for error on response : ", response)
     if is_error(response):
         raise SonicServerError(response)
     return response
@@ -114,7 +113,6 @@ class SonicClient:
         if self._socket is not None:
             return self._socket
         self._socket = socket.create_connection(self.address)
-        print("socket created")
         return self._socket
 
     @property
@@ -133,7 +131,6 @@ class SonicClient:
 
     def connect(self):
         resp = self.reader.readline()
-        print(resp)
         if 'CONNECTED' in resp:
             self.connected = True
 
@@ -164,7 +161,6 @@ class SonicClient:
                 "command {} isn't allowed in channel {}".format(cmd, self.channel))
 
         cmd_str = self.format_command(cmd, *args)
-        print("sending cmd: >{}<".format(cmd_str))
         self.writer.write(cmd_str)
         self.writer.flush()
         resp = self._get_response()
@@ -237,7 +233,6 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         query_id = resp_query_id.split()[-1]
         resp_result = self.reader.readline()
         resp_result.strip()
-        print(resp_result)
         return resp_result.split()[3:]
 
     def suggest(self, collection, bucket, word, limit=None):
@@ -247,7 +242,6 @@ class SearchClient(SonicClient, CommonCommandsMixin):
             'SUGGEST', collection, bucket, word, limit)
         resp_result = self.reader.readline()
         resp_result.strip()
-        print(resp_result)
         return resp_result.split()[3:]
 
 
