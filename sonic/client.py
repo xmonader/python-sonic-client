@@ -99,8 +99,8 @@ class SonicClient:
         self.password = password
         self.channel = channel  # ingest, search, control
         self._socket = None
-        self._reader = None
-        self._writer = None
+        self.__reader = None
+        self.__writer = None
         self.bufsize = 0
         self.protocol = 1
 
@@ -116,21 +116,21 @@ class SonicClient:
         return self._socket
 
     @property
-    def reader(self):
-        if self._reader is not None:
-            return self._reader
-        self._reader = self.socket.makefile('r')
-        return self._reader
+    def _reader(self):
+        if self.__reader is not None:
+            return self.__reader
+        self.__reader = self.socket.makefile('r')
+        return self.__reader
 
     @property
-    def writer(self):
-        if self._writer is not None:
-            return self._writer
-        self._writer = self.socket.makefile('w')
-        return self._writer
+    def _writer(self):
+        if self.__writer is not None:
+            return self.__writer
+        self.__writer = self.socket.makefile('w')
+        return self.__writer
 
     def connect(self):
-        resp = self.reader.readline()
+        resp = self._reader.readline()
         if 'CONNECTED' in resp:
             self.connected = True
 
@@ -145,8 +145,8 @@ class SonicClient:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._reader.close()
-        self._writer.close()
+        self.__reader.close()
+        self.__writer.close()
         self._socket.close()
 
     def format_command(self, cmd, *args):
@@ -161,13 +161,13 @@ class SonicClient:
                 "command {} isn't allowed in channel {}".format(cmd, self.channel))
 
         cmd_str = self.format_command(cmd, *args)
-        self.writer.write(cmd_str)
-        self.writer.flush()
+        self._writer.write(cmd_str)
+        self._writer.flush()
         resp = self._get_response()
         return resp
 
     def _get_response(self):
-        return raise_for_error(self.reader.readline())
+        return raise_for_error(self._reader.readline())
 
 
 class CommonCommandsMixin:
@@ -228,19 +228,18 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         offset = "OFFSET({})".format(offset) if offset else ''
 
         terms = quote_text(terms)
-        resp_query_id = self._execute_command(
+        self._execute_command(
             'QUERY', collection, bucket, terms, limit, offset, lang)
-        query_id = resp_query_id.split()[-1]
-        resp_result = self.reader.readline()
+        resp_result = self._reader.readline()
         resp_result.strip()
         return resp_result.split()[3:]
 
     def suggest(self, collection, bucket, word, limit=None):
         limit = "LIMIT({})".format(limit) if limit else ''
         word = quote_text(word)
-        resp_query_id = self._execute_command(
+        self._execute_command(
             'SUGGEST', collection, bucket, word, limit)
-        resp_result = self.reader.readline()
+        resp_result = self._reader.readline()
         resp_result.strip()
         return resp_result.split()[3:]
 
