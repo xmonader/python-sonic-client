@@ -6,10 +6,8 @@ import re
 class SonicServerError(Exception):
     pass
 
-class ChannelError(Exception):
-    pass
 
-class InvalidCommandError(Exception):
+class ChannelError(Exception):
     pass
 
 
@@ -27,7 +25,8 @@ ALL_CMDS = {
     ],
     'ingest': [
         *COMMON_CMDS,
-        'PUSH',    # PUSH <collection> <bucket> <object> "<text>" [LANG(<locale>)]?
+        # PUSH <collection> <bucket> <object> "<text>" [LANG(<locale>)]?
+        'PUSH',
         'POP',     # POP <collection> <bucket> <object> "<text>"
         'COUNT',   # COUNT <collection> [<bucket> [<object>]?]?
         'FLUSHC',  # FLUSHC <collection>
@@ -36,17 +35,20 @@ ALL_CMDS = {
     ],
     'search': [
         *COMMON_CMDS,
-        'QUERY',    # QUERY <collection> <bucket> "<terms>" [LIMIT(<count>)]? [OFFSET(<count>)]? [LANG(<locale>)]?
+        # QUERY <collection> <bucket> "<terms>" [LIMIT(<count>)]? [OFFSET(<count>)]? [LANG(<locale>)]?
+        'QUERY',
         'SUGGEST',  # SUGGEST <collection> <bucket> "<word>" [LIMIT(<count>)]?
-
 
     ]
 
 }
+
+
 def quote_text(text):
     if text is None:
         return ""
     return '"' + text.replace('"', '\\"').replace('\r\n', ' ') + '"'
+
 
 def is_error(response):
     if response.startswith('ERR '):
@@ -59,6 +61,7 @@ def raise_for_error(response):
     if is_error(response):
         raise SonicServerError(response)
     return response
+
 
 def _parse_protocol_version(s):
     """STARTED search protocol(1) buffer(20000)"""
@@ -75,6 +78,7 @@ def _parse_buffer_size(s):
         raise ValueError("{s} doesn't contain buffer(NUMBER)".format(s))
     return matches[0]
 
+
 def _get_async_response_id(s):
     "'PENDING gn4RLF8M\n'"
     s = s.strip()
@@ -83,9 +87,11 @@ def _get_async_response_id(s):
         raise ValueError("{s} doesn't contain async response id")
     return matches[0]
 
+
 INGEST = 'ingest'
 SEARCH = 'search'
 CONTROL = 'control'
+
 
 class SonicClient:
     def __init__(self, host, port, password, channel):
@@ -154,7 +160,8 @@ class SonicClient:
 
     def _execute_command(self, cmd, *args):
         if cmd not in ALL_CMDS[self.channel]:
-            raise ChannelError("command {} isn't allowed in channel {}".format(cmd, self.channel))
+            raise ChannelError(
+                "command {} isn't allowed in channel {}".format(cmd, self.channel))
 
         cmd_str = self.format_command(cmd, *args)
         print("sending cmd: >{}<".format(cmd_str))
@@ -165,6 +172,7 @@ class SonicClient:
 
     def _get_response(self):
         return raise_for_error(self.reader.readline())
+
 
 class CommonCommandsMixin:
     def ping(self):
@@ -208,22 +216,24 @@ class IngestClient(SonicClient, CommonCommandsMixin):
     def flush(self, collection, bucket=None, object=None):
         if not bucket and not object:
             return self.flush_collection(collection)
-        elif bucket and not object :
+        elif bucket and not object:
             return self.flush_bucket(collection, bucket)
         elif object and bucket:
             return self.flush_object(collection, bucket, object)
+
 
 class SearchClient(SonicClient, CommonCommandsMixin):
     def __init__(self, host, port, password):
         super().__init__(host, port, password, SEARCH)
 
     def query(self, collection, bucket, terms, limit=None, offset=None, lang=None):
-        limit =  "LIMIT({})".format(limit) if limit else ''
+        limit = "LIMIT({})".format(limit) if limit else ''
         lang = "LANG({})".format(lang) if lang else ''
         offset = "OFFSET({})".format(offset) if offset else ''
 
         terms = quote_text(terms)
-        resp_query_id = self._execute_command('QUERY', collection, bucket, terms, limit, offset, lang)
+        resp_query_id = self._execute_command(
+            'QUERY', collection, bucket, terms, limit, offset, lang)
         query_id = resp_query_id.split()[-1]
         resp_result = self.reader.readline()
         resp_result.strip()
@@ -231,9 +241,10 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         return resp_result.split()[3:]
 
     def suggest(self, collection, bucket, word, limit=None):
-        limit =  "LIMIT({})".format(limit) if limit else ''
+        limit = "LIMIT({})".format(limit) if limit else ''
         word = quote_text(word)
-        resp_query_id = self._execute_command('SUGGEST', collection, bucket, word, limit)
+        resp_query_id = self._execute_command(
+            'SUGGEST', collection, bucket, word, limit)
         resp_result = self.reader.readline()
         resp_result.strip()
         print(resp_result)
@@ -245,17 +256,22 @@ def test_ingest():
         print(ingestcl.ping())
         print(ingestcl.protocol)
         print(ingestcl.bufsize)
-        ingestcl.push("wiki", "articles", "article-1", "for the love of god hell")
-        ingestcl.push("wiki", "articles", "article-2", "for the love of satan heaven")
-        ingestcl.push("wiki", "articles", "article-3", "for the love of lorde hello")
-        ingestcl.push("wiki", "articles", "article-4", "for the god of loaf helmet")
+        ingestcl.push("wiki", "articles", "article-1",
+                      "for the love of god hell")
+        ingestcl.push("wiki", "articles", "article-2",
+                      "for the love of satan heaven")
+        ingestcl.push("wiki", "articles", "article-3",
+                      "for the love of lorde hello")
+        ingestcl.push("wiki", "articles", "article-4",
+                      "for the god of loaf helmet")
+
 
 def test_search():
     with SearchClient("127.0.0.1", '1491', 'dmdm') as querycl:
         print(querycl.ping())
         print(querycl.query("wiki", "articles", "for"))
         print(querycl.query("wiki", "articles", "love"))
-        print(querycl.suggest("wiki", "articles","hell"))
+        print(querycl.suggest("wiki", "articles", "hell"))
 
 
 if __name__ == "__main__":
