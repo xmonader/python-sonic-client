@@ -533,7 +533,7 @@ class ControlClient(SonicClient, CommonCommandsMixin):
 
 
 def test_ingest():
-    with IngestClient("127.0.0.1", 1491, 'dmdm') as ingestcl:
+    with IngestClient("127.0.0.1", 1491, 'password') as ingestcl:
         print(ingestcl.ping())
         print(ingestcl.protocol)
         print(ingestcl.bufsize)
@@ -548,7 +548,7 @@ def test_ingest():
 
 
 def test_search():
-    with SearchClient("127.0.0.1", 1491, 'dmdm') as querycl:
+    with SearchClient("127.0.0.1", 1491, 'password') as querycl:
         print(querycl.ping())
         print(querycl.query("wiki", "articles", "for"))
         print(querycl.query("wiki", "articles", "love"))
@@ -556,7 +556,7 @@ def test_search():
 
 
 def test_control():
-    with ControlClient("127.0.0.1", 1491, 'dmdm') as controlcl:
+    with ControlClient("127.0.0.1", 1491, 'password') as controlcl:
         print(controlcl.ping())
         controlcl.trigger("consolidate")
 
