@@ -49,6 +49,11 @@ with ControlClient("127.0.0.1", 1491, "password") as controlcl:
     controlcl.trigger("consolidate")
 ```
 
+## API reference
+
+API documentation can be found at [docs/api](./docs/api) and also [Browsable](https://xmonader.github.io/python-sonic-client/api/sonic/)
+
+
 ## Difference from asonic
 
 asonic uses asyncio and this client doesn't. It grew out of needing to use sonic within gevent context  
