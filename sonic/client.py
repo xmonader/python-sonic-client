@@ -86,7 +86,7 @@ def raise_for_error(response):
         response {str} -- message to check if it's error or not.
 
     Raises:
-        SonicServerError -- 
+        SonicServerError --
 
     Returns:
         str -- the response message
@@ -134,7 +134,7 @@ def _parse_buffer_size(text):
 
 
 def _get_async_response_id(text):
-    """Extract async response message id. 
+    """Extract async response message id.
 
     Arguments:
         text {str} -- text that may contain async response id (e.g PENDING gn4RLF8M )
@@ -152,6 +152,18 @@ def _get_async_response_id(text):
     return matches[0]
 
 
+def pythonify_result(resp):
+    if resp in ["OK", "PONG"]:
+        return True
+
+    if resp.startswith("EVENT QUERY") or resp.startswith("EVENT SUGGEST"):
+        return resp.split()[3:]
+
+    if resp.startswith("RESULT"):
+        return int(resp.split()[-1])
+    return resp
+
+
 # Channels names
 INGEST = 'ingest'
 SEARCH = 'search'
@@ -161,15 +173,29 @@ CONTROL = 'control'
 class SonicClient:
 
     def __init__(self, host: str, port: int, password: str, channel: str):
+        """Base for sonic clients 
+
+        bufsize: indicates the buffer size to be used while communicating with the server.
+        protocol: sonic protocol version
+
+        Arguments:
+            host {str} -- sonic server host
+            port {int} -- sonic server port
+            password {str} -- user password defined in `config.cfg` file on the server side.
+            channel {str} -- channel name one of (ingest, search, control)
+
+        """
+
         self.host = host
         self.port = port
-        self.password = password
+        self._password = password
         self.channel = channel
         self.__socket = None
         self.__reader = None
         self.__writer = None
         self.bufsize = 0
         self.protocol = 1
+        self.raw = False
 
     @property
     def address(self):
@@ -197,21 +223,24 @@ class SonicClient:
         return self.__writer
 
     def connect(self):
+        """Connects to sonic server endpoint
+
+        Returns:
+            bool: True when connection happens and successfully switched to a channel.  
+        """
         resp = self._reader.readline()
         if 'CONNECTED' in resp:
             self.connected = True
 
-        resp = self._execute_command("START", self.channel, self.password)
+        resp = self._execute_command("START", self.channel, self._password)
         self.protocol = _parse_protocol_version(resp)
         self.bufsize = _parse_buffer_size(resp)
 
         return True
 
-    def __enter__(self):
-        self.connect()
-        return self
-
-    def _close(self):
+    def close(self):
+        """close the connection and clean up open resources.
+        """
         resources = (self.__reader, self.__writer, self.__socket)
         for rc in resources:
             if rc is not None:
@@ -219,29 +248,67 @@ class SonicClient:
         self.__reader = None
         self.__writer = None
         self.__socket = None
+        self.connected = False
+
+    def __enter__(self):
+        self.connect()
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._close()
+        self.close()
 
-    def format_command(self, cmd, *args):
+    def _format_command(self, cmd, *args):
+        """Format command according to sonic protocol
+
+        Arguments:
+            cmd {str} -- a valid sonic command
+
+        Returns:
+            str -- formatted command string to be sent on the wire.
+        """
         cmd_str = cmd + " "
         cmd_str += " ".join(args)
         cmd_str += "\n"  # specs says \n, asonic does \r\n
         return cmd_str
 
     def _execute_command(self, cmd, *args):
+        """Formats and sends command with suitable arguments on the wire to sonic server
+
+        Arguments:
+            cmd {str} -- valid command
+
+        Raises:
+            ChannelError -- Raised for unsupported channel commands
+
+        Returns:
+            object|str -- depends on the `self.raw` mode
+                if mode is raw: result is always a string
+                else the result is converted to suitable python response (e.g boolean, int, list)
+        """
         if cmd not in ALL_CMDS[self.channel]:
             raise ChannelError(
                 "command {} isn't allowed in channel {}".format(cmd, self.channel))
 
-        cmd_str = self.format_command(cmd, *args)
+        cmd_str = self._format_command(cmd, *args)
         self._writer.write(cmd_str)
         self._writer.flush()
         resp = self._get_response()
+
         return resp
 
     def _get_response(self):
-        return raise_for_error(self._reader.readline()).strip()
+        """Gets a response string from sonic server.
+
+        Returns:
+            object|str -- depends on the `self.raw` mode
+                if mode is raw: result is always a string
+                else the result is converted to suitable python response (e.g boolean, int, list)
+        """
+
+        resp = raise_for_error(self._reader.readline()).strip()
+        if not self.raw:
+            return pythonify_result(resp)
+        return resp
 
 
 class CommonCommandsMixin:
@@ -251,16 +318,16 @@ class CommonCommandsMixin:
         """Send ping command to the server
 
         Returns:
-            str -- PONG
+            bool -- True if successfully reaching the server.
         """
         return self._execute_command("PING")
 
     def quit(self):
-        """Quit the channel
+        """Quit the channel and closes the connection.
 
         """
         self._execute_command("QUIT")
-        self._close()
+        self.close()
 
     # TODO: check help.
     def help(self, *args):
@@ -285,7 +352,7 @@ class IngestClient(SonicClient, CommonCommandsMixin):
             lang {str} -- [description] (default: {None})
 
         Returns:
-            [str] -- 'OK'
+            bool -- True if search data are pushed in the index. 
         """
 
         lang = "LANG({})".format(lang) if lang else ''
@@ -302,13 +369,13 @@ class IngestClient(SonicClient, CommonCommandsMixin):
             text {str} -- search text to be indexed can be a single word, or a longer text; within maximum length safety limits
 
         Returns:
-            [type] -- [description]
+            int 
         """
         text = quote_text(text)
         return self._execute_command("POP", collection, bucket, object, text)
 
     def count(self, collection: str, bucket: str=None, object: str=None):
-        """Count indexed search data 
+        """Count indexed search data
 
         Arguments:
             collection {str} --  index collection (ie. what you search in, eg. messages, products, etc.)
@@ -318,7 +385,7 @@ class IngestClient(SonicClient, CommonCommandsMixin):
             object {str} --  object identifier that refers to an entity in an external database, where the searched object is stored (eg. you use Sonic to index CRM contacts by name; full CRM contact data is stored in a MySQL database; in this case the object identifier in Sonic will be the MySQL primary key for the CRM contact)
 
         Returns:
-            [type] -- [description]
+            int -- count of index search data.
         """
         bucket = bucket or ''
         object = object or ''
@@ -331,7 +398,7 @@ class IngestClient(SonicClient, CommonCommandsMixin):
             collection {str} --  index collection (ie. what you search in, eg. messages, products, etc.)
 
         Returns:
-            [type] -- [description]
+            int -- number of flushed data
         """
         return self._execute_command('FLUSHC', collection)
 
@@ -342,9 +409,8 @@ class IngestClient(SonicClient, CommonCommandsMixin):
             collection {str} --  index collection (ie. what you search in, eg. messages, products, etc.)
             bucket {str} -- index bucket name (ie. user-specific search classifier in the collection if you have any eg. user-1, user-2, .., otherwise use a common bucket name eg. generic, default, common, ..)
 
-
         Returns:
-            [type] -- [description]
+            int -- number of flushed data
         """
         return self._execute_command('FLUSHB', collection, bucket)
 
@@ -356,9 +422,8 @@ class IngestClient(SonicClient, CommonCommandsMixin):
             bucket {str} -- index bucket name (ie. user-specific search classifier in the collection if you have any eg. user-1, user-2, .., otherwise use a common bucket name eg. generic, default, common, ..)
             object {str} --  object identifier that refers to an entity in an external database, where the searched object is stored (eg. you use Sonic to index CRM contacts by name; full CRM contact data is stored in a MySQL database; in this case the object identifier in Sonic will be the MySQL primary key for the CRM contact)
 
-
         Returns:
-            [type] -- [description]
+            int -- number of flushed data
         """
         return self._execute_command('FLUSHO', collection, bucket, object)
 
@@ -373,7 +438,7 @@ class IngestClient(SonicClient, CommonCommandsMixin):
             object {str} --  object identifier that refers to an entity in an external database, where the searched object is stored (eg. you use Sonic to index CRM contacts by name; full CRM contact data is stored in a MySQL database; in this case the object identifier in Sonic will be the MySQL primary key for the CRM contact)
 
         Returns:
-            [type] -- [description]
+            int -- number of flushed data
         """
         if not bucket and not object:
             return self.flush_collection(collection)
@@ -396,7 +461,7 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         super().__init__(host, port, password, SEARCH)
 
     def query(self, collection: str, bucket: str, terms: str, limit: int=None, offset: int=None, lang: str=None):
-        """Query the database 
+        """Query the database
 
         Arguments:
             collection {str} -- index collection (ie. what you search in, eg. messages, products, etc.)
@@ -404,9 +469,9 @@ class SearchClient(SonicClient, CommonCommandsMixin):
             terms {str} --  text for search terms
 
         Keyword Arguments:
-            limit {[type]} -- a positive integer number; set within allowed maximum & minimum limits
-            offset {[type]} -- a positive integer number; set within allowed maximum & minimum limits
-            lang {[type]} -- an ISO 639-3 locale code eg. eng for English (if set, the locale must be a valid ISO 639-3 code; if not set, the locale will be guessed from text).
+            limit {int} -- a positive integer number; set within allowed maximum & minimum limits
+            offset {int} -- a positive integer number; set within allowed maximum & minimum limits
+            lang {str} -- an ISO 639-3 locale code eg. eng for English (if set, the locale must be a valid ISO 639-3 code; if not set, the locale will be guessed from text).
 
         Returns:
             list -- list of objects ids.
@@ -419,10 +484,10 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         self._execute_command(
             'QUERY', collection, bucket, terms, limit, offset, lang)
         resp_result = self._get_response()
-        return resp_result.split()[3:]
+        return resp_result
 
     def suggest(self, collection: str, bucket: str, word: str, limit: int=None):
-        """auto-completes word. 
+        """auto-completes word.
 
         Arguments:
             collection {str} -- index collection (ie. what you search in, eg. messages, products, etc.)
@@ -431,7 +496,7 @@ class SearchClient(SonicClient, CommonCommandsMixin):
 
 
         Keyword Arguments:
-            limit {[type]} -- a positive integer number; set within allowed maximum & minimum limits (default: {None})
+            limit {int} -- a positive integer number; set within allowed maximum & minimum limits (default: {None})
 
         Returns:
             list -- list of suggested words.
@@ -441,7 +506,7 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         self._execute_command(
             'SUGGEST', collection, bucket, word, limit)
         resp_result = self._get_response()
-        return resp_result.split()[3:]
+        return resp_result
 
 
 def test_ingest():
