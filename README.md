@@ -36,9 +36,18 @@ with SearchClient("127.0.0.1", 1491, "password") as querycl:
     print(querycl.query("wiki", "articles", "for"))
     print(querycl.query("wiki", "articles", "love"))
     print(querycl.suggest("wiki", "articles", "hell"))
-
 ```
 
+
+### Control
+
+```python
+from sonic import ControlClient
+
+with ControlClient("127.0.0.1", 1491, "password") as controlcl:
+    print(controlcl.ping())
+    controlcl.trigger("consolidate")
+```
 
 ## Difference from asonic
 

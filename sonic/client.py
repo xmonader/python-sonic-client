@@ -42,9 +42,11 @@ ALL_CMDS = {
         # QUERY <collection> <bucket> "<terms>" [LIMIT(<count>)]? [OFFSET(<count>)]? [LANG(<locale>)]?
         'QUERY',
         'SUGGEST',  # SUGGEST <collection> <bucket> "<word>" [LIMIT(<count>)]?
-
+    ],
+    'control': [
+        *COMMON_CMDS,
+        'TRIGGER',  # TRIGGER [<action>]?
     ]
-
 }
 
 # snippet from asonic code.
@@ -444,6 +446,27 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         return resp_result.split()[3:]
 
 
+class ControlClient(SonicClient, CommonCommandsMixin):
+    def __init__(self, host: str, port: int, password: str):
+        """Create Sonic client that operates on the Control Channel
+
+        Arguments:
+            host {str} -- valid reachable host address
+            port {int} -- port number
+            password {str} -- password (defined in config.cfg file on the server side)
+
+        """
+        super().__init__(host, port, password, CONTROL)
+
+    def trigger(self, action: str=''):
+        """Trigger an action
+
+        Keyword Arguments:
+            action {str} --  text for action
+        """
+        self._execute_command('TRIGGER', action)
+
+
 def test_ingest():
     with IngestClient("127.0.0.1", 1491, 'dmdm') as ingestcl:
         print(ingestcl.ping())
@@ -467,6 +490,13 @@ def test_search():
         print(querycl.suggest("wiki", "articles", "hell"))
 
 
+def test_control():
+    with ControlClient("127.0.0.1", 1491, 'dmdm') as controlcl:
+        print(controlcl.ping())
+        controlcl.trigger("consolidate")
+
+
 if __name__ == "__main__":
     test_ingest()
     test_search()
+    test_control()
