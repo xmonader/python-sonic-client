@@ -327,14 +327,14 @@ class ConnectionPool:
 
     def __init__(self, **create_kwargs):
         self._inuse_connections = set()
-        self._all_connections = Queue()
+        self._available_connections = Queue()
         self._create_kwargs = create_kwargs
 
     def get_connection(self):
         conn = None
 
-        if not self._all_connections.empty():
-            conn = self._all_connections.get()
+        if not self._available_connections.empty():
+            conn = self._available_connections.get()
         else:
             # make connection and add to active connections
             conn = self._make_connection()
@@ -345,7 +345,7 @@ class ConnectionPool:
     def release(self, conn):
         self._inuse_connections.remove(conn)
         if conn.ping():
-            self._all_connections.put_nowait(conn)
+            self._available_connections.put_nowait(conn)
 
     def _make_connection(self):
         con = SonicConnection(**self._create_kwargs)
@@ -355,7 +355,7 @@ class ConnectionPool:
 
 class SonicClient:
 
-    def __init__(self, host: str, port: int, password: str, channel: str):
+    def __init__(self, host: str, port: int, password: str, channel: str, pool: ConnectionPool=None):
         """Base for sonic clients 
 
         bufsize: indicates the buffer size to be used while communicating with the server.
@@ -378,8 +378,9 @@ class SonicClient:
         self.raw = False
         self.address = self.host, self.port
 
-        self.pool = ConnectionPool(
-            host=host, port=port, password=password, channel=channel)
+        if not pool:
+            self.pool = ConnectionPool(
+                host=host, port=port, password=password, channel=channel)
 
     def close(self):
         """close the connection and clean up open resources.
