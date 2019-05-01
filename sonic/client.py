@@ -1,6 +1,7 @@
 from enum import Enum
 import socket
 import re
+from queue import Queue
 
 
 class SonicServerError(Exception):
@@ -172,73 +173,22 @@ SEARCH = 'search'
 CONTROL = 'control'
 
 
-class ConnectionPool:
-
-    def __init__(self, address):
-        self._active_connections = []
-        self._all_connections = []
-        self._address = address
-
-    def get_connection(self):
-        # print("**CALLED..")
-        conn = None
-        if self._active_connections:
-            conn = self._active_connections.pop()
-        else:
-            print("CREATING NEW CONNECTION")
-            # make connection and add to active connections
-            conn = self._make_connection()
-        self._active_connections.append(conn)
-        return conn
-
-    def release(self, conn):
-        self._active_connections.remove(conn)
-        self._all_connections.append(conn)
-
-    def _make_connection(self):
-        return socket.create_connection(self._address)
-
-
-class SonicClient:
-
-    def __init__(self, host: str, port: int, password: str, channel: str):
-        """Base for sonic clients 
-
-        bufsize: indicates the buffer size to be used while communicating with the server.
-        protocol: sonic protocol version
-
-        Arguments:
-            host {str} -- sonic server host
-            port {int} -- sonic server port
-            password {str} -- user password defined in `config.cfg` file on the server side.
-            channel {str} -- channel name one of (ingest, search, control)
-
-        """
-
+class SonicConnection:
+    def __init__(self, host: str, port: int, password: str, channel: str, keepalive: bool=True, timeout: int=60):
         self.host = host
         self.port = port
         self._password = password
         self.channel = channel
+        self.raw = False
+        self.address = self.host, self.port
+        self.keepalive = keepalive
+        self.timeout = timeout
+        self.socket_connect_timeout = 10
         self.__socket = None
         self.__reader = None
         self.__writer = None
-        self.bufsize = 0
-        self.protocol = 1
-        self.raw = False
-        self.address = self.host, self.port
-        self.pool = ConnectionPool(self.address)
-
-    @property
-    def _socket(self):
-        return self.pool.get_connection()
-
-    @property
-    def _reader(self):
-        return self._socket.makefile('r')
-
-    @property
-    def _writer(self):
-        return self._socket.makefile('w')
+        self.bufize = None
+        self.protocol = None
 
     def connect(self):
         """Connects to sonic server endpoint
@@ -254,19 +204,71 @@ class SonicClient:
         self.protocol = _parse_protocol_version(resp)
         self.bufsize = _parse_buffer_size(resp)
 
-        return True
+        return self.ping()
 
-    def close(self):
-        """close the connection and clean up open resources.
-        """
-        pass
+    def ping(self):
+        return self._execute_command("PING") == "PONG"
 
-    def __enter__(self):
-        self.connect()
-        return self
+    def __create_connection(self, address):
+        "Create a TCP socket connection"
+        # we want to mimic what socket.create_connection does to support
+        # ipv4/ipv6, but we want to set options prior to calling
+        # socket.connect()
+        # snippet taken from redis client code.
+        err = None
+        for res in socket.getaddrinfo(self.host, self.port, 0,
+                                      socket.SOCK_STREAM):
+            family, socktype, proto, canonname, socket_address = res
+            sock = None
+            try:
+                sock = socket.socket(family, socktype, proto)
+                # TCP_NODELAY
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+                # TCP_KEEPALIVE
+                if self.keepalive:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+                # set the socket_connect_timeout before we connect
+                if self.socket_connect_timeout:
+                    sock.settimeout(self.timeout)
+
+                # connect
+                sock.connect(socket_address)
+
+                # set the socket_timeout now that we're connected
+                if self.timeout:
+                    sock.settimeout(self.timeout)
+                return sock
+
+            except socket.error as _:
+                err = _
+                if sock is not None:
+                    sock.close()
+
+        if err is not None:
+            raise err
+        raise socket.error("socket.getaddrinfo returned an empty list")
+
+    @property
+    def _socket(self):
+        if not self.__socket:
+            # socket.create_connection(self.address)
+            self.__socket = self.__create_connection(self.address)
+
+        return self.__socket
+
+    @property
+    def _reader(self):
+        if not self.__reader:
+            self.__reader = self._socket.makefile('r')
+        return self.__reader
+
+    @property
+    def _writer(self):
+        if not self.__writer:
+            self.__writer = self._socket.makefile('w')
+        return self.__writer
 
     def _format_command(self, cmd, *args):
         """Format command according to sonic protocol
@@ -301,11 +303,10 @@ class SonicClient:
                 "command {} isn't allowed in channel {}".format(cmd, self.channel))
 
         cmd_str = self._format_command(cmd, *args)
-        print("CMD: ", cmd_str)
+
         self._writer.write(cmd_str)
         self._writer.flush()
         resp = self._get_response()
-        print("RESP: ", resp)
         return resp
 
     def _get_response(self):
@@ -316,10 +317,101 @@ class SonicClient:
                 if mode is raw: result is always a string
                 else the result is converted to suitable python response (e.g boolean, int, list)
         """
-
         resp = raise_for_error(self._reader.readline()).strip()
         if not self.raw:
             return pythonify_result(resp)
+        return resp
+
+
+class ConnectionPool:
+
+    def __init__(self, **create_kwargs):
+        self._inuse_connections = set()
+        self._all_connections = Queue()
+        self._create_kwargs = create_kwargs
+
+    def get_connection(self):
+        conn = None
+
+        if not self._all_connections.empty():
+            conn = self._all_connections.get()
+        else:
+            # make connection and add to active connections
+            conn = self._make_connection()
+
+        self._inuse_connections.add(conn)
+        return conn
+
+    def release(self, conn):
+        self._inuse_connections.remove(conn)
+        if conn.ping():
+            self._all_connections.put_nowait(conn)
+
+    def _make_connection(self):
+        con = SonicConnection(**self._create_kwargs)
+        con.connect()
+        return con
+
+
+class SonicClient:
+
+    def __init__(self, host: str, port: int, password: str, channel: str):
+        """Base for sonic clients 
+
+        bufsize: indicates the buffer size to be used while communicating with the server.
+        protocol: sonic protocol version
+
+        Arguments:
+            host {str} -- sonic server host
+            port {int} -- sonic server port
+            password {str} -- user password defined in `config.cfg` file on the server side.
+            channel {str} -- channel name one of (ingest, search, control)
+
+        """
+
+        self.host = host
+        self.port = port
+        self._password = password
+        self.channel = channel
+        self.bufsize = 0
+        self.protocol = 1
+        self.raw = False
+        self.address = self.host, self.port
+
+        self.pool = ConnectionPool(
+            host=host, port=port, password=password, channel=channel)
+
+    def close(self):
+        """close the connection and clean up open resources.
+        """
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def get_active_connection(self):
+        active = self.pool.get_connection()
+        active.raw = self.raw
+        return active
+
+    def _execute_command(self, cmd, *args):
+        active = self.get_active_connection()
+        try:
+            res = active._execute_command(cmd, *args)
+        finally:
+            self.pool.release(active)
+        return res
+
+    def _execute_command_async(self, cmd, *args):
+        active = self.get_active_connection()
+        try:
+            active._execute_command(cmd, *args)
+            resp = active._get_response()
+        finally:
+            self.pool.release(active)
         return resp
 
 
@@ -493,11 +585,8 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         offset = "OFFSET({})".format(offset) if offset else ''
 
         terms = quote_text(terms)
-        self._execute_command(
+        return self._execute_command_async(
             'QUERY', collection, bucket, terms, limit, offset, lang)
-        resp_result = self._get_response()
-
-        return resp_result
 
     def suggest(self, collection: str, bucket: str, word: str, limit: int=None):
         """auto-completes word.
@@ -516,10 +605,8 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         """
         limit = "LIMIT({})".format(limit) if limit else ''
         word = quote_text(word)
-        self._execute_command(
+        return self._execute_command(
             'SUGGEST', collection, bucket, word, limit)
-        resp_result = self._get_response()
-        return resp_result
 
 
 class ControlClient(SonicClient, CommonCommandsMixin):
@@ -563,7 +650,6 @@ def test_search():
         print(querycl.ping())
         print(querycl.query("wiki", "articles", "for"))
         print(querycl.query("wiki", "articles", "love"))
-        # print(querycl.suggest("wiki", "articles", "hell"))
 
 
 def test_control():
