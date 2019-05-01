@@ -172,6 +172,33 @@ SEARCH = 'search'
 CONTROL = 'control'
 
 
+class ConnectionPool:
+
+    def __init__(self, address):
+        self._active_connections = []
+        self._all_connections = []
+        self._address = address
+
+    def get_connection(self):
+        # print("**CALLED..")
+        conn = None
+        if self._active_connections:
+            conn = self._active_connections.pop()
+        else:
+            print("CREATING NEW CONNECTION")
+            # make connection and add to active connections
+            conn = self._make_connection()
+        self._active_connections.append(conn)
+        return conn
+
+    def release(self, conn):
+        self._active_connections.remove(conn)
+        self._all_connections.append(conn)
+
+    def _make_connection(self):
+        return socket.create_connection(self._address)
+
+
 class SonicClient:
 
     def __init__(self, host: str, port: int, password: str, channel: str):
@@ -198,31 +225,20 @@ class SonicClient:
         self.bufsize = 0
         self.protocol = 1
         self.raw = False
-
-    @property
-    def address(self):
-        return self.host, self.port
+        self.address = self.host, self.port
+        self.pool = ConnectionPool(self.address)
 
     @property
     def _socket(self):
-        if self.__socket is not None:
-            return self.__socket
-        self.__socket = socket.create_connection(self.address)
-        return self.__socket
+        return self.pool.get_connection()
 
     @property
     def _reader(self):
-        if self.__reader is not None:
-            return self.__reader
-        self.__reader = self._socket.makefile('r')
-        return self.__reader
+        return self._socket.makefile('r')
 
     @property
     def _writer(self):
-        if self.__writer is not None:
-            return self.__writer
-        self.__writer = self._socket.makefile('w')
-        return self.__writer
+        return self._socket.makefile('w')
 
     def connect(self):
         """Connects to sonic server endpoint
@@ -243,14 +259,7 @@ class SonicClient:
     def close(self):
         """close the connection and clean up open resources.
         """
-        resources = (self.__reader, self.__writer, self.__socket)
-        for rc in resources:
-            if rc is not None:
-                rc.close()
-        self.__reader = None
-        self.__writer = None
-        self.__socket = None
-        self.connected = False
+        pass
 
     def __enter__(self):
         self.connect()
@@ -292,10 +301,11 @@ class SonicClient:
                 "command {} isn't allowed in channel {}".format(cmd, self.channel))
 
         cmd_str = self._format_command(cmd, *args)
+        print("CMD: ", cmd_str)
         self._writer.write(cmd_str)
         self._writer.flush()
         resp = self._get_response()
-
+        print("RESP: ", resp)
         return resp
 
     def _get_response(self):
@@ -486,6 +496,7 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         self._execute_command(
             'QUERY', collection, bucket, terms, limit, offset, lang)
         resp_result = self._get_response()
+
         return resp_result
 
     def suggest(self, collection: str, bucket: str, word: str, limit: int=None):
@@ -552,7 +563,7 @@ def test_search():
         print(querycl.ping())
         print(querycl.query("wiki", "articles", "for"))
         print(querycl.query("wiki", "articles", "love"))
-        print(querycl.suggest("wiki", "articles", "hell"))
+        # print(querycl.suggest("wiki", "articles", "hell"))
 
 
 def test_control():
