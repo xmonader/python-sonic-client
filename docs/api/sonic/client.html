@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1" />
-<meta name="generator" content="pdoc 0.5.3" />
+<meta name="generator" content="pdoc 0.5.4" />
 <title>sonic.client API documentation</title>
 <meta name="description" content="" />
 <link href='https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.0/normalize.min.css' rel='stylesheet'>
@@ -25,6 +25,7 @@
 <pre><code class="python">from enum import Enum
 import socket
 import re
+from queue import Queue
 
 
 class SonicServerError(Exception):
@@ -196,57 +197,22 @@ SEARCH = &#39;search&#39;
 CONTROL = &#39;control&#39;
 
 
-class SonicClient:
-
-    def __init__(self, host: str, port: int, password: str, channel: str):
-        &#34;&#34;&#34;Base for sonic clients 
-
-        bufsize: indicates the buffer size to be used while communicating with the server.
-        protocol: sonic protocol version
-
-        Arguments:
-            host {str} -- sonic server host
-            port {int} -- sonic server port
-            password {str} -- user password defined in `config.cfg` file on the server side.
-            channel {str} -- channel name one of (ingest, search, control)
-
-        &#34;&#34;&#34;
-
+class SonicConnection:
+    def __init__(self, host: str, port: int, password: str, channel: str, keepalive: bool=True, timeout: int=60):
         self.host = host
         self.port = port
         self._password = password
         self.channel = channel
+        self.raw = False
+        self.address = self.host, self.port
+        self.keepalive = keepalive
+        self.timeout = timeout
+        self.socket_connect_timeout = 10
         self.__socket = None
         self.__reader = None
         self.__writer = None
-        self.bufsize = 0
-        self.protocol = 1
-        self.raw = False
-
-    @property
-    def address(self):
-        return self.host, self.port
-
-    @property
-    def _socket(self):
-        if self.__socket is not None:
-            return self.__socket
-        self.__socket = socket.create_connection(self.address)
-        return self.__socket
-
-    @property
-    def _reader(self):
-        if self.__reader is not None:
-            return self.__reader
-        self.__reader = self._socket.makefile(&#39;r&#39;)
-        return self.__reader
-
-    @property
-    def _writer(self):
-        if self.__writer is not None:
-            return self.__writer
-        self.__writer = self._socket.makefile(&#39;w&#39;)
-        return self.__writer
+        self.bufize = None
+        self.protocol = None
 
     def connect(self):
         &#34;&#34;&#34;Connects to sonic server endpoint
@@ -262,26 +228,71 @@ class SonicClient:
         self.protocol = _parse_protocol_version(resp)
         self.bufsize = _parse_buffer_size(resp)
 
-        return True
+        return self.ping()
 
-    def close(self):
-        &#34;&#34;&#34;close the connection and clean up open resources.
-        &#34;&#34;&#34;
-        resources = (self.__reader, self.__writer, self.__socket)
-        for rc in resources:
-            if rc is not None:
-                rc.close()
-        self.__reader = None
-        self.__writer = None
-        self.__socket = None
-        self.connected = False
+    def ping(self):
+        return self._execute_command(&#34;PING&#34;) == &#34;PONG&#34;
 
-    def __enter__(self):
-        self.connect()
-        return self
+    def __create_connection(self, address):
+        &#34;Create a TCP socket connection&#34;
+        # we want to mimic what socket.create_connection does to support
+        # ipv4/ipv6, but we want to set options prior to calling
+        # socket.connect()
+        # snippet taken from redis client code.
+        err = None
+        for res in socket.getaddrinfo(self.host, self.port, 0,
+                                      socket.SOCK_STREAM):
+            family, socktype, proto, canonname, socket_address = res
+            sock = None
+            try:
+                sock = socket.socket(family, socktype, proto)
+                # TCP_NODELAY
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+                # TCP_KEEPALIVE
+                if self.keepalive:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+                # set the socket_connect_timeout before we connect
+                if self.socket_connect_timeout:
+                    sock.settimeout(self.timeout)
+
+                # connect
+                sock.connect(socket_address)
+
+                # set the socket_timeout now that we&#39;re connected
+                if self.timeout:
+                    sock.settimeout(self.timeout)
+                return sock
+
+            except socket.error as _:
+                err = _
+                if sock is not None:
+                    sock.close()
+
+        if err is not None:
+            raise err
+        raise socket.error(&#34;socket.getaddrinfo returned an empty list&#34;)
+
+    @property
+    def _socket(self):
+        if not self.__socket:
+            # socket.create_connection(self.address)
+            self.__socket = self.__create_connection(self.address)
+
+        return self.__socket
+
+    @property
+    def _reader(self):
+        if not self.__reader:
+            self.__reader = self._socket.makefile(&#39;r&#39;)
+        return self.__reader
+
+    @property
+    def _writer(self):
+        if not self.__writer:
+            self.__writer = self._socket.makefile(&#39;w&#39;)
+        return self.__writer
 
     def _format_command(self, cmd, *args):
         &#34;&#34;&#34;Format command according to sonic protocol
@@ -316,10 +327,10 @@ class SonicClient:
                 &#34;command {} isn&#39;t allowed in channel {}&#34;.format(cmd, self.channel))
 
         cmd_str = self._format_command(cmd, *args)
+
         self._writer.write(cmd_str)
         self._writer.flush()
         resp = self._get_response()
-
         return resp
 
     def _get_response(self):
@@ -330,10 +341,102 @@ class SonicClient:
                 if mode is raw: result is always a string
                 else the result is converted to suitable python response (e.g boolean, int, list)
         &#34;&#34;&#34;
-
         resp = raise_for_error(self._reader.readline()).strip()
         if not self.raw:
             return pythonify_result(resp)
+        return resp
+
+
+class ConnectionPool:
+
+    def __init__(self, **create_kwargs):
+        self._inuse_connections = set()
+        self._available_connections = Queue()
+        self._create_kwargs = create_kwargs
+
+    def get_connection(self):
+        conn = None
+
+        if not self._available_connections.empty():
+            conn = self._available_connections.get()
+        else:
+            # make connection and add to active connections
+            conn = self._make_connection()
+
+        self._inuse_connections.add(conn)
+        return conn
+
+    def release(self, conn):
+        self._inuse_connections.remove(conn)
+        if conn.ping():
+            self._available_connections.put_nowait(conn)
+
+    def _make_connection(self):
+        con = SonicConnection(**self._create_kwargs)
+        con.connect()
+        return con
+
+
+class SonicClient:
+
+    def __init__(self, host: str, port: int, password: str, channel: str, pool: ConnectionPool=None):
+        &#34;&#34;&#34;Base for sonic clients 
+
+        bufsize: indicates the buffer size to be used while communicating with the server.
+        protocol: sonic protocol version
+
+        Arguments:
+            host {str} -- sonic server host
+            port {int} -- sonic server port
+            password {str} -- user password defined in `config.cfg` file on the server side.
+            channel {str} -- channel name one of (ingest, search, control)
+
+        &#34;&#34;&#34;
+
+        self.host = host
+        self.port = port
+        self._password = password
+        self.channel = channel
+        self.bufsize = 0
+        self.protocol = 1
+        self.raw = False
+        self.address = self.host, self.port
+
+        if not pool:
+            self.pool = ConnectionPool(
+                host=host, port=port, password=password, channel=channel)
+
+    def close(self):
+        &#34;&#34;&#34;close the connection and clean up open resources.
+        &#34;&#34;&#34;
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def get_active_connection(self):
+        active = self.pool.get_connection()
+        active.raw = self.raw
+        return active
+
+    def _execute_command(self, cmd, *args):
+        active = self.get_active_connection()
+        try:
+            res = active._execute_command(cmd, *args)
+        finally:
+            self.pool.release(active)
+        return res
+
+    def _execute_command_async(self, cmd, *args):
+        active = self.get_active_connection()
+        try:
+            active._execute_command(cmd, *args)
+            resp = active._get_response()
+        finally:
+            self.pool.release(active)
         return resp
 
 
@@ -507,10 +610,8 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         offset = &#34;OFFSET({})&#34;.format(offset) if offset else &#39;&#39;
 
         terms = quote_text(terms)
-        self._execute_command(
+        return self._execute_command_async(
             &#39;QUERY&#39;, collection, bucket, terms, limit, offset, lang)
-        resp_result = self._get_response()
-        return resp_result
 
     def suggest(self, collection: str, bucket: str, word: str, limit: int=None):
         &#34;&#34;&#34;auto-completes word.
@@ -529,10 +630,8 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         &#34;&#34;&#34;
         limit = &#34;LIMIT({})&#34;.format(limit) if limit else &#39;&#39;
         word = quote_text(word)
-        self._execute_command(
+        return self._execute_command(
             &#39;SUGGEST&#39;, collection, bucket, word, limit)
-        resp_result = self._get_response()
-        return resp_result
 
 
 class ControlClient(SonicClient, CommonCommandsMixin):
@@ -576,7 +675,6 @@ def test_search():
         print(querycl.ping())
         print(querycl.query(&#34;wiki&#34;, &#34;articles&#34;, &#34;for&#34;))
         print(querycl.query(&#34;wiki&#34;, &#34;articles&#34;, &#34;love&#34;))
-        print(querycl.suggest(&#34;wiki&#34;, &#34;articles&#34;, &#34;hell&#34;))
 
 
 def test_control():
@@ -745,8 +843,7 @@ if __name__ == &#34;__main__&#34;:
     with SearchClient(&#34;127.0.0.1&#34;, 1491, &#39;password&#39;) as querycl:
         print(querycl.ping())
         print(querycl.query(&#34;wiki&#34;, &#34;articles&#34;, &#34;for&#34;))
-        print(querycl.query(&#34;wiki&#34;, &#34;articles&#34;, &#34;love&#34;))
-        print(querycl.suggest(&#34;wiki&#34;, &#34;articles&#34;, &#34;hell&#34;))</code></pre>
+        print(querycl.query(&#34;wiki&#34;, &#34;articles&#34;, &#34;love&#34;))</code></pre>
 </details>
 </dd>
 </dl>
@@ -852,6 +949,93 @@ if __name__ == &#34;__main__&#34;:
 </dd>
 </dl>
 </dd>
+<dt id="sonic.client.ConnectionPool"><code class="flex name class">
+<span>class <span class="ident">ConnectionPool</span></span>
+</code></dt>
+<dd>
+<section class="desc"></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">class ConnectionPool:
+
+    def __init__(self, **create_kwargs):
+        self._inuse_connections = set()
+        self._available_connections = Queue()
+        self._create_kwargs = create_kwargs
+
+    def get_connection(self):
+        conn = None
+
+        if not self._available_connections.empty():
+            conn = self._available_connections.get()
+        else:
+            # make connection and add to active connections
+            conn = self._make_connection()
+
+        self._inuse_connections.add(conn)
+        return conn
+
+    def release(self, conn):
+        self._inuse_connections.remove(conn)
+        if conn.ping():
+            self._available_connections.put_nowait(conn)
+
+    def _make_connection(self):
+        con = SonicConnection(**self._create_kwargs)
+        con.connect()
+        return con</code></pre>
+</details>
+<h3>Methods</h3>
+<dl>
+<dt id="sonic.client.ConnectionPool.__init__"><code class="name flex">
+<span>def <span class="ident">__init__</span></span>(<span>self, **create_kwargs)</span>
+</code></dt>
+<dd>
+<section class="desc"><p>Initialize self.
+See help(type(self)) for accurate signature.</p></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">def __init__(self, **create_kwargs):
+    self._inuse_connections = set()
+    self._available_connections = Queue()
+    self._create_kwargs = create_kwargs</code></pre>
+</details>
+</dd>
+<dt id="sonic.client.ConnectionPool.get_connection"><code class="name flex">
+<span>def <span class="ident">get_connection</span></span>(<span>self)</span>
+</code></dt>
+<dd>
+<section class="desc"></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">def get_connection(self):
+    conn = None
+
+    if not self._available_connections.empty():
+        conn = self._available_connections.get()
+    else:
+        # make connection and add to active connections
+        conn = self._make_connection()
+
+    self._inuse_connections.add(conn)
+    return conn</code></pre>
+</details>
+</dd>
+<dt id="sonic.client.ConnectionPool.release"><code class="name flex">
+<span>def <span class="ident">release</span></span>(<span>self, conn)</span>
+</code></dt>
+<dd>
+<section class="desc"></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">def release(self, conn):
+    self._inuse_connections.remove(conn)
+    if conn.ping():
+        self._available_connections.put_nowait(conn)</code></pre>
+</details>
+</dd>
+</dl>
+</dd>
 <dt id="sonic.client.ControlClient"><code class="flex name class">
 <span>class <span class="ident">ControlClient</span></span>
 <span>(</span><span><small>ancestors:</small> <a title="sonic.client.SonicClient" href="#sonic.client.SonicClient">SonicClient</a>, <a title="sonic.client.CommonCommandsMixin" href="#sonic.client.CommonCommandsMixin">CommonCommandsMixin</a>)</span>
@@ -930,7 +1114,6 @@ text for action</p></section>
 <li><code><b><a title="sonic.client.SonicClient" href="#sonic.client.SonicClient">SonicClient</a></b></code>:
 <ul class="hlist">
 <li><code><a title="sonic.client.SonicClient.close" href="#sonic.client.SonicClient.close">close</a></code></li>
-<li><code><a title="sonic.client.SonicClient.connect" href="#sonic.client.SonicClient.connect">connect</a></code></li>
 </ul>
 </li>
 <li><code><b><a title="sonic.client.CommonCommandsMixin" href="#sonic.client.CommonCommandsMixin">CommonCommandsMixin</a></b></code>:
@@ -1292,7 +1475,6 @@ lang {str} &ndash; [description] (default: {None})</p>
 <ul class="hlist">
 <li><code><a title="sonic.client.SonicClient.__init__" href="#sonic.client.SonicClient.__init__">__init__</a></code></li>
 <li><code><a title="sonic.client.SonicClient.close" href="#sonic.client.SonicClient.close">close</a></code></li>
-<li><code><a title="sonic.client.SonicClient.connect" href="#sonic.client.SonicClient.connect">connect</a></code></li>
 </ul>
 </li>
 <li><code><b><a title="sonic.client.CommonCommandsMixin" href="#sonic.client.CommonCommandsMixin">CommonCommandsMixin</a></b></code>:
@@ -1345,10 +1527,8 @@ lang {str} &ndash; [description] (default: {None})</p>
         offset = &#34;OFFSET({})&#34;.format(offset) if offset else &#39;&#39;
 
         terms = quote_text(terms)
-        self._execute_command(
+        return self._execute_command_async(
             &#39;QUERY&#39;, collection, bucket, terms, limit, offset, lang)
-        resp_result = self._get_response()
-        return resp_result
 
     def suggest(self, collection: str, bucket: str, word: str, limit: int=None):
         &#34;&#34;&#34;auto-completes word.
@@ -1367,10 +1547,8 @@ lang {str} &ndash; [description] (default: {None})</p>
         &#34;&#34;&#34;
         limit = &#34;LIMIT({})&#34;.format(limit) if limit else &#39;&#39;
         word = quote_text(word)
-        self._execute_command(
-            &#39;SUGGEST&#39;, collection, bucket, word, limit)
-        resp_result = self._get_response()
-        return resp_result</code></pre>
+        return self._execute_command(
+            &#39;SUGGEST&#39;, collection, bucket, word, limit)</code></pre>
 </details>
 <h3>Methods</h3>
 <dl>
@@ -1436,10 +1614,8 @@ lang {str} &ndash; an ISO 639-3 locale code eg. eng for English (if set, the loc
     offset = &#34;OFFSET({})&#34;.format(offset) if offset else &#39;&#39;
 
     terms = quote_text(terms)
-    self._execute_command(
-        &#39;QUERY&#39;, collection, bucket, terms, limit, offset, lang)
-    resp_result = self._get_response()
-    return resp_result</code></pre>
+    return self._execute_command_async(
+        &#39;QUERY&#39;, collection, bucket, terms, limit, offset, lang)</code></pre>
 </details>
 </dd>
 <dt id="sonic.client.SearchClient.suggest"><code class="name flex">
@@ -1475,10 +1651,8 @@ limit {int} &ndash; a positive integer number; set within allowed maximum &amp; 
     &#34;&#34;&#34;
     limit = &#34;LIMIT({})&#34;.format(limit) if limit else &#39;&#39;
     word = quote_text(word)
-    self._execute_command(
-        &#39;SUGGEST&#39;, collection, bucket, word, limit)
-    resp_result = self._get_response()
-    return resp_result</code></pre>
+    return self._execute_command(
+        &#39;SUGGEST&#39;, collection, bucket, word, limit)</code></pre>
 </details>
 </dd>
 </dl>
@@ -1487,7 +1661,6 @@ limit {int} &ndash; a positive integer number; set within allowed maximum &amp; 
 <li><code><b><a title="sonic.client.SonicClient" href="#sonic.client.SonicClient">SonicClient</a></b></code>:
 <ul class="hlist">
 <li><code><a title="sonic.client.SonicClient.close" href="#sonic.client.SonicClient.close">close</a></code></li>
-<li><code><a title="sonic.client.SonicClient.connect" href="#sonic.client.SonicClient.connect">connect</a></code></li>
 </ul>
 </li>
 <li><code><b><a title="sonic.client.CommonCommandsMixin" href="#sonic.client.CommonCommandsMixin">CommonCommandsMixin</a></b></code>:
@@ -1508,7 +1681,7 @@ limit {int} &ndash; a positive integer number; set within allowed maximum &amp; 
 <summary>Source code</summary>
 <pre><code class="python">class SonicClient:
 
-    def __init__(self, host: str, port: int, password: str, channel: str):
+    def __init__(self, host: str, port: int, password: str, channel: str, pool: ConnectionPool=None):
         &#34;&#34;&#34;Base for sonic clients 
 
         bufsize: indicates the buffer size to be used while communicating with the server.
@@ -1526,37 +1699,152 @@ limit {int} &ndash; a positive integer number; set within allowed maximum &amp; 
         self.port = port
         self._password = password
         self.channel = channel
-        self.__socket = None
-        self.__reader = None
-        self.__writer = None
         self.bufsize = 0
         self.protocol = 1
         self.raw = False
+        self.address = self.host, self.port
 
-    @property
-    def address(self):
-        return self.host, self.port
+        if not pool:
+            self.pool = ConnectionPool(
+                host=host, port=port, password=password, channel=channel)
 
-    @property
-    def _socket(self):
-        if self.__socket is not None:
-            return self.__socket
-        self.__socket = socket.create_connection(self.address)
-        return self.__socket
+    def close(self):
+        &#34;&#34;&#34;close the connection and clean up open resources.
+        &#34;&#34;&#34;
+        pass
 
-    @property
-    def _reader(self):
-        if self.__reader is not None:
-            return self.__reader
-        self.__reader = self._socket.makefile(&#39;r&#39;)
-        return self.__reader
+    def __enter__(self):
+        return self
 
-    @property
-    def _writer(self):
-        if self.__writer is not None:
-            return self.__writer
-        self.__writer = self._socket.makefile(&#39;w&#39;)
-        return self.__writer
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def get_active_connection(self):
+        active = self.pool.get_connection()
+        active.raw = self.raw
+        return active
+
+    def _execute_command(self, cmd, *args):
+        active = self.get_active_connection()
+        try:
+            res = active._execute_command(cmd, *args)
+        finally:
+            self.pool.release(active)
+        return res
+
+    def _execute_command_async(self, cmd, *args):
+        active = self.get_active_connection()
+        try:
+            active._execute_command(cmd, *args)
+            resp = active._get_response()
+        finally:
+            self.pool.release(active)
+        return resp</code></pre>
+</details>
+<h3>Subclasses</h3>
+<ul class="hlist">
+<li><a title="sonic.client.IngestClient" href="#sonic.client.IngestClient">IngestClient</a></li>
+<li><a title="sonic.client.SearchClient" href="#sonic.client.SearchClient">SearchClient</a></li>
+<li><a title="sonic.client.ControlClient" href="#sonic.client.ControlClient">ControlClient</a></li>
+</ul>
+<h3>Methods</h3>
+<dl>
+<dt id="sonic.client.SonicClient.__init__"><code class="name flex">
+<span>def <span class="ident">__init__</span></span>(<span>self, host, port, password, channel, pool=None)</span>
+</code></dt>
+<dd>
+<section class="desc"><p>Base for sonic clients </p>
+<dl>
+<dt>bufsize: indicates the buffer size to be used while communicating with the server.</dt>
+<dt><strong><code>protocol</code></strong> :&ensp;<a title="sonic" href="index.html"><code>sonic</code></a> <code>protocol</code> <code>version</code></dt>
+<dd>&nbsp;</dd>
+</dl>
+<h2 id="arguments">Arguments</h2>
+<p>host {str} &ndash; sonic server host
+port {int} &ndash; sonic server port
+password {str} &ndash; user password defined in <code>config.cfg</code> file on the server side.
+channel {str} &ndash; channel name one of (ingest, search, control)</p></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">def __init__(self, host: str, port: int, password: str, channel: str, pool: ConnectionPool=None):
+    &#34;&#34;&#34;Base for sonic clients 
+
+    bufsize: indicates the buffer size to be used while communicating with the server.
+    protocol: sonic protocol version
+
+    Arguments:
+        host {str} -- sonic server host
+        port {int} -- sonic server port
+        password {str} -- user password defined in `config.cfg` file on the server side.
+        channel {str} -- channel name one of (ingest, search, control)
+
+    &#34;&#34;&#34;
+
+    self.host = host
+    self.port = port
+    self._password = password
+    self.channel = channel
+    self.bufsize = 0
+    self.protocol = 1
+    self.raw = False
+    self.address = self.host, self.port
+
+    if not pool:
+        self.pool = ConnectionPool(
+            host=host, port=port, password=password, channel=channel)</code></pre>
+</details>
+</dd>
+<dt id="sonic.client.SonicClient.close"><code class="name flex">
+<span>def <span class="ident">close</span></span>(<span>self)</span>
+</code></dt>
+<dd>
+<section class="desc"><p>close the connection and clean up open resources.</p></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">def close(self):
+    &#34;&#34;&#34;close the connection and clean up open resources.
+    &#34;&#34;&#34;
+    pass</code></pre>
+</details>
+</dd>
+<dt id="sonic.client.SonicClient.get_active_connection"><code class="name flex">
+<span>def <span class="ident">get_active_connection</span></span>(<span>self)</span>
+</code></dt>
+<dd>
+<section class="desc"></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">def get_active_connection(self):
+    active = self.pool.get_connection()
+    active.raw = self.raw
+    return active</code></pre>
+</details>
+</dd>
+</dl>
+</dd>
+<dt id="sonic.client.SonicConnection"><code class="flex name class">
+<span>class <span class="ident">SonicConnection</span></span>
+</code></dt>
+<dd>
+<section class="desc"></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">class SonicConnection:
+    def __init__(self, host: str, port: int, password: str, channel: str, keepalive: bool=True, timeout: int=60):
+        self.host = host
+        self.port = port
+        self._password = password
+        self.channel = channel
+        self.raw = False
+        self.address = self.host, self.port
+        self.keepalive = keepalive
+        self.timeout = timeout
+        self.socket_connect_timeout = 10
+        self.__socket = None
+        self.__reader = None
+        self.__writer = None
+        self.bufize = None
+        self.protocol = None
 
     def connect(self):
         &#34;&#34;&#34;Connects to sonic server endpoint
@@ -1572,26 +1860,71 @@ limit {int} &ndash; a positive integer number; set within allowed maximum &amp; 
         self.protocol = _parse_protocol_version(resp)
         self.bufsize = _parse_buffer_size(resp)
 
-        return True
+        return self.ping()
 
-    def close(self):
-        &#34;&#34;&#34;close the connection and clean up open resources.
-        &#34;&#34;&#34;
-        resources = (self.__reader, self.__writer, self.__socket)
-        for rc in resources:
-            if rc is not None:
-                rc.close()
-        self.__reader = None
-        self.__writer = None
-        self.__socket = None
-        self.connected = False
+    def ping(self):
+        return self._execute_command(&#34;PING&#34;) == &#34;PONG&#34;
 
-    def __enter__(self):
-        self.connect()
-        return self
+    def __create_connection(self, address):
+        &#34;Create a TCP socket connection&#34;
+        # we want to mimic what socket.create_connection does to support
+        # ipv4/ipv6, but we want to set options prior to calling
+        # socket.connect()
+        # snippet taken from redis client code.
+        err = None
+        for res in socket.getaddrinfo(self.host, self.port, 0,
+                                      socket.SOCK_STREAM):
+            family, socktype, proto, canonname, socket_address = res
+            sock = None
+            try:
+                sock = socket.socket(family, socktype, proto)
+                # TCP_NODELAY
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+                # TCP_KEEPALIVE
+                if self.keepalive:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+                # set the socket_connect_timeout before we connect
+                if self.socket_connect_timeout:
+                    sock.settimeout(self.timeout)
+
+                # connect
+                sock.connect(socket_address)
+
+                # set the socket_timeout now that we&#39;re connected
+                if self.timeout:
+                    sock.settimeout(self.timeout)
+                return sock
+
+            except socket.error as _:
+                err = _
+                if sock is not None:
+                    sock.close()
+
+        if err is not None:
+            raise err
+        raise socket.error(&#34;socket.getaddrinfo returned an empty list&#34;)
+
+    @property
+    def _socket(self):
+        if not self.__socket:
+            # socket.create_connection(self.address)
+            self.__socket = self.__create_connection(self.address)
+
+        return self.__socket
+
+    @property
+    def _reader(self):
+        if not self.__reader:
+            self.__reader = self._socket.makefile(&#39;r&#39;)
+        return self.__reader
+
+    @property
+    def _writer(self):
+        if not self.__writer:
+            self.__writer = self._socket.makefile(&#39;w&#39;)
+        return self.__writer
 
     def _format_command(self, cmd, *args):
         &#34;&#34;&#34;Format command according to sonic protocol
@@ -1626,10 +1959,10 @@ limit {int} &ndash; a positive integer number; set within allowed maximum &amp; 
                 &#34;command {} isn&#39;t allowed in channel {}&#34;.format(cmd, self.channel))
 
         cmd_str = self._format_command(cmd, *args)
+
         self._writer.write(cmd_str)
         self._writer.flush()
         resp = self._get_response()
-
         return resp
 
     def _get_response(self):
@@ -1640,97 +1973,39 @@ limit {int} &ndash; a positive integer number; set within allowed maximum &amp; 
                 if mode is raw: result is always a string
                 else the result is converted to suitable python response (e.g boolean, int, list)
         &#34;&#34;&#34;
-
         resp = raise_for_error(self._reader.readline()).strip()
         if not self.raw:
             return pythonify_result(resp)
         return resp</code></pre>
 </details>
-<h3>Subclasses</h3>
-<ul class="hlist">
-<li><a title="sonic.client.IngestClient" href="#sonic.client.IngestClient">IngestClient</a></li>
-<li><a title="sonic.client.SearchClient" href="#sonic.client.SearchClient">SearchClient</a></li>
-<li><a title="sonic.client.ControlClient" href="#sonic.client.ControlClient">ControlClient</a></li>
-</ul>
-<h3>Instance variables</h3>
-<dl>
-<dt id="sonic.client.SonicClient.address"><code class="name">var <span class="ident">address</span></code></dt>
-<dd>
-<section class="desc"></section>
-<details class="source">
-<summary>Source code</summary>
-<pre><code class="python">@property
-def address(self):
-    return self.host, self.port</code></pre>
-</details>
-</dd>
-</dl>
 <h3>Methods</h3>
 <dl>
-<dt id="sonic.client.SonicClient.__init__"><code class="name flex">
-<span>def <span class="ident">__init__</span></span>(<span>self, host, port, password, channel)</span>
+<dt id="sonic.client.SonicConnection.__init__"><code class="name flex">
+<span>def <span class="ident">__init__</span></span>(<span>self, host, port, password, channel, keepalive=True, timeout=60)</span>
 </code></dt>
 <dd>
-<section class="desc"><p>Base for sonic clients </p>
-<dl>
-<dt>bufsize: indicates the buffer size to be used while communicating with the server.</dt>
-<dt><strong><code>protocol</code></strong> :&ensp;<a title="sonic" href="index.html"><code>sonic</code></a> <code>protocol</code> <code>version</code></dt>
-<dd>&nbsp;</dd>
-</dl>
-<h2 id="arguments">Arguments</h2>
-<p>host {str} &ndash; sonic server host
-port {int} &ndash; sonic server port
-password {str} &ndash; user password defined in <code>config.cfg</code> file on the server side.
-channel {str} &ndash; channel name one of (ingest, search, control)</p></section>
+<section class="desc"><p>Initialize self.
+See help(type(self)) for accurate signature.</p></section>
 <details class="source">
 <summary>Source code</summary>
-<pre><code class="python">def __init__(self, host: str, port: int, password: str, channel: str):
-    &#34;&#34;&#34;Base for sonic clients 
-
-    bufsize: indicates the buffer size to be used while communicating with the server.
-    protocol: sonic protocol version
-
-    Arguments:
-        host {str} -- sonic server host
-        port {int} -- sonic server port
-        password {str} -- user password defined in `config.cfg` file on the server side.
-        channel {str} -- channel name one of (ingest, search, control)
-
-    &#34;&#34;&#34;
-
+<pre><code class="python">def __init__(self, host: str, port: int, password: str, channel: str, keepalive: bool=True, timeout: int=60):
     self.host = host
     self.port = port
     self._password = password
     self.channel = channel
+    self.raw = False
+    self.address = self.host, self.port
+    self.keepalive = keepalive
+    self.timeout = timeout
+    self.socket_connect_timeout = 10
     self.__socket = None
     self.__reader = None
     self.__writer = None
-    self.bufsize = 0
-    self.protocol = 1
-    self.raw = False</code></pre>
+    self.bufize = None
+    self.protocol = None</code></pre>
 </details>
 </dd>
-<dt id="sonic.client.SonicClient.close"><code class="name flex">
-<span>def <span class="ident">close</span></span>(<span>self)</span>
-</code></dt>
-<dd>
-<section class="desc"><p>close the connection and clean up open resources.</p></section>
-<details class="source">
-<summary>Source code</summary>
-<pre><code class="python">def close(self):
-    &#34;&#34;&#34;close the connection and clean up open resources.
-    &#34;&#34;&#34;
-    resources = (self.__reader, self.__writer, self.__socket)
-    for rc in resources:
-        if rc is not None:
-            rc.close()
-    self.__reader = None
-    self.__writer = None
-    self.__socket = None
-    self.connected = False</code></pre>
-</details>
-</dd>
-<dt id="sonic.client.SonicClient.connect"><code class="name flex">
+<dt id="sonic.client.SonicConnection.connect"><code class="name flex">
 <span>def <span class="ident">connect</span></span>(<span>self)</span>
 </code></dt>
 <dd>
@@ -1756,7 +2031,18 @@ channel {str} &ndash; channel name one of (ingest, search, control)</p></section
     self.protocol = _parse_protocol_version(resp)
     self.bufsize = _parse_buffer_size(resp)
 
-    return True</code></pre>
+    return self.ping()</code></pre>
+</details>
+</dd>
+<dt id="sonic.client.SonicConnection.ping"><code class="name flex">
+<span>def <span class="ident">ping</span></span>(<span>self)</span>
+</code></dt>
+<dd>
+<section class="desc"></section>
+<details class="source">
+<summary>Source code</summary>
+<pre><code class="python">def ping(self):
+    return self._execute_command(&#34;PING&#34;) == &#34;PONG&#34;</code></pre>
 </details>
 </dd>
 </dl>
@@ -1813,6 +2099,14 @@ channel {str} &ndash; channel name one of (ingest, search, control)</p></section
 </ul>
 </li>
 <li>
+<h4><code><a title="sonic.client.ConnectionPool" href="#sonic.client.ConnectionPool">ConnectionPool</a></code></h4>
+<ul class="">
+<li><code><a title="sonic.client.ConnectionPool.__init__" href="#sonic.client.ConnectionPool.__init__">__init__</a></code></li>
+<li><code><a title="sonic.client.ConnectionPool.get_connection" href="#sonic.client.ConnectionPool.get_connection">get_connection</a></code></li>
+<li><code><a title="sonic.client.ConnectionPool.release" href="#sonic.client.ConnectionPool.release">release</a></code></li>
+</ul>
+</li>
+<li>
 <h4><code><a title="sonic.client.ControlClient" href="#sonic.client.ControlClient">ControlClient</a></code></h4>
 <ul class="">
 <li><code><a title="sonic.client.ControlClient.__init__" href="#sonic.client.ControlClient.__init__">__init__</a></code></li>
@@ -1843,9 +2137,16 @@ channel {str} &ndash; channel name one of (ingest, search, control)</p></section
 <h4><code><a title="sonic.client.SonicClient" href="#sonic.client.SonicClient">SonicClient</a></code></h4>
 <ul class="">
 <li><code><a title="sonic.client.SonicClient.__init__" href="#sonic.client.SonicClient.__init__">__init__</a></code></li>
-<li><code><a title="sonic.client.SonicClient.address" href="#sonic.client.SonicClient.address">address</a></code></li>
 <li><code><a title="sonic.client.SonicClient.close" href="#sonic.client.SonicClient.close">close</a></code></li>
-<li><code><a title="sonic.client.SonicClient.connect" href="#sonic.client.SonicClient.connect">connect</a></code></li>
+<li><code><a title="sonic.client.SonicClient.get_active_connection" href="#sonic.client.SonicClient.get_active_connection">get_active_connection</a></code></li>
+</ul>
+</li>
+<li>
+<h4><code><a title="sonic.client.SonicConnection" href="#sonic.client.SonicConnection">SonicConnection</a></code></h4>
+<ul class="">
+<li><code><a title="sonic.client.SonicConnection.__init__" href="#sonic.client.SonicConnection.__init__">__init__</a></code></li>
+<li><code><a title="sonic.client.SonicConnection.connect" href="#sonic.client.SonicConnection.connect">connect</a></code></li>
+<li><code><a title="sonic.client.SonicConnection.ping" href="#sonic.client.SonicConnection.ping">ping</a></code></li>
 </ul>
 </li>
 <li>
@@ -1857,7 +2158,7 @@ channel {str} &ndash; channel name one of (ingest, search, control)</p></section
 </nav>
 </main>
 <footer id="footer">
-<p>Generated by <a href="https://pdoc3.github.io/pdoc"><cite>pdoc</cite> 0.5.3</a>.</p>
+<p>Generated by <a href="https://pdoc3.github.io/pdoc"><cite>pdoc</cite> 0.5.4</a>.</p>
 </footer>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/highlight.min.js"></script>
 <script>hljs.initHighlightingOnLoad()</script>
