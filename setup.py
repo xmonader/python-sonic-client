@@ -8,7 +8,7 @@ with open('README.md') as f:
     long_description = f.read()
 
 setup(name='sonic-client',
-      version='0.0.3',
+      version='0.0.4',
       author="Ahmed T. Youssef",
       author_email="xmonader@gmail.com",
       description='python client for sonic search backend',
