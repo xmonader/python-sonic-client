@@ -65,7 +65,7 @@ def quote_text(text):
     """
     if text is None:
         return ""
-    return '"' + text.replace('"', '\\"').replace('\r\n', ' ') + '"'
+    return '"' + text.replace('"', '\\"').replace('\r\n', ' ').replace('\n', ' ') + '"'
 
 
 def is_error(response):
