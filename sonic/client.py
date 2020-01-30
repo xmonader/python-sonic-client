@@ -487,6 +487,21 @@ class SonicClient:
             self.pool.release(active)
         return resp
 
+    def _split(self, text, bloat):
+        size = self.bufsize - bloat + 20
+        print(self.bufsize)
+        if len(text) <= size:
+            yield text
+            return
+        while len(text) > 0:
+            # Split words with violence
+            yield text[:size]
+            if len(text) > size:
+                text = text[size:]
+            else:
+                text = ''
+
+
 class CommonCommandsMixin:
     """Mixin of the commands used by all sonic channels."""
 
@@ -532,8 +547,10 @@ class IngestClient(SonicClient, CommonCommandsMixin):
         """
 
         lang = "LANG({})".format(lang) if lang else ''
-        text = quote_text(text)
-        return self._execute_command("PUSH", collection, bucket, object, text, lang)
+        for group in self._split(text, len("".join(["PUSH", collection, bucket]))):
+            text = quote_text(text)
+            resp = self._execute_command("PUSH", collection, bucket, object, text, lang)
+        return resp
 
     def pop(self, collection: str, bucket: str, object: str, text: str):
         """Pop search data from the index
