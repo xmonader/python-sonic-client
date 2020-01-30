@@ -118,7 +118,7 @@ def _parse_protocol_version(text):
     return matches[0]
 
 
-def _parse_buffer_size(text):
+def _parse_buffer_size(text: str) -> int:
     """Extracts buffering from response message
 
     Arguments:
@@ -128,13 +128,13 @@ def _parse_buffer_size(text):
         ValueError -- Raised when s doesn't have buffering information
 
     Returns:
-        str -- buffering.
+        int -- buffer size.
     """
 
-    matches = re.findall("buffer\((\w+)\)", text)
+    matches = re.findall("buffer\(([0-9]+)\)", text)
     if not matches:
         raise ValueError("{} doesn't contain buffer(NUMBER)".format(text))
-    return matches[0]
+    return int(matches[0])
 
 
 def _get_async_response_id(text):
@@ -463,6 +463,7 @@ class SonicClient:
             str|object -- result of execution
         """
         active = self.get_active_connection()
+        self.bufsize = active.bufsize
         try:
             res = active._execute_command(cmd, *args)
         finally:
