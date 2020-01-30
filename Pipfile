@@ -5,8 +5,13 @@ verify_ssl = true
 
 [dev-packages]
 pdoc3 = "*"
+flake8 = "*"
+black = "*"
 
 [packages]
 
 [requires]
 python_version = "3.6"
+
+[pipenv]
+allow_prereleases = true

@@ -343,7 +343,11 @@ class SonicConnection:
                 if mode is raw: result is always a string
                 else the result is converted to suitable python response (e.g boolean, int, list)
         """
-        resp = raise_for_error(self._reader.readline()).strip()
+        try:
+            resp = raise_for_error(self._reader.readline()).strip()
+        except Exception as e:
+            self._socket.close()
+            raise e
         if not self.raw:
             return pythonify_result(resp)
         return resp
