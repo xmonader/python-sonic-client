@@ -489,17 +489,8 @@ class SonicClient:
 
     def _split(self, text, bloat):
         size = self.bufsize - bloat + 20
-        print(self.bufsize)
-        if len(text) <= size:
-            yield text
-            return
-        while len(text) > 0:
-            # Split words with violence
-            yield text[:size]
-            if len(text) > size:
-                text = text[size:]
-            else:
-                text = ''
+        for i in range(0, len(text), size):
+            yield text[i:i + size]
 
 
 class CommonCommandsMixin:
