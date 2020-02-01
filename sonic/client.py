@@ -488,10 +488,31 @@ class SonicClient:
             self.pool.release(active)
         return resp
 
-    def _split(self, text, bloat):
-        size = self.bufsize - bloat + 20
-        for i in range(0, len(text), size):
-            yield text[i:i + size]
+
+def split(text: str, size: int, sep:str=" "):
+    if sep != " ":
+        text = text.translate(str.maketrans(dict((a, " ") for a in sep)))
+    poz = 0
+    while poz < len(text):
+        chunk = text[poz:poz+size]
+        if len(chunk) < size: # this is the end
+            yield chunk
+            return
+        if (text[poz+size-1] not in sep) and (text[poz+size] not in sep):
+            x = chunk.rfind(" ")
+            if x != -1: # Can split on space
+                poz += x
+                yield chunk[:x]
+                continue
+        poz += size
+        yield chunk
+
+
+def test_split():
+    txt = "The lazy dog jump over the wizard, that's all."
+    groups = list(split(txt, 10, " ,;.:"))
+    print(groups)
+    assert len(groups) == 6
 
 
 class CommonCommandsMixin:
@@ -539,7 +560,9 @@ class IngestClient(SonicClient, CommonCommandsMixin):
         """
 
         lang = "LANG({})".format(lang) if lang else ''
-        for group in self._split(text, len("".join(["PUSH", collection, bucket]))):
+        for group in split(text,
+                           self.bufsize - len("".join(["PUSH", collection, bucket])),
+                           ";.:,\n\r\t"):
             text = quote_text(text)
             resp = self._execute_command("PUSH", collection, bucket, object, text, lang)
         return resp
@@ -740,6 +763,7 @@ def test_control():
 
 
 if __name__ == "__main__":
+    test_split()
     test_ingest()
     test_search()
     test_control()
