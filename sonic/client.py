@@ -498,7 +498,7 @@ def split(text: str, size: int, sep:str=" "):
         if len(chunk) < size: # this is the end
             yield chunk
             return
-        if (text[poz+size-1] not in sep) and (text[poz+size] not in sep):
+        if (text[poz+size-1] != " ") and (text[poz+size] != " "):
             x = chunk.rfind(" ")
             if x != -1: # Can split on space
                 poz += x
