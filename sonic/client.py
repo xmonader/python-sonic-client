@@ -222,7 +222,8 @@ class SonicConnection:
         return self.ping()
 
     def ping(self):
-        return self._execute_command("PING")
+        res = self._execute_command("PING")
+        return res == "PONG" if self.raw else res
 
     def __create_connection(self, address):
         "Create a TCP socket connection"
