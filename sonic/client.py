@@ -277,13 +277,13 @@ class SonicConnection:
     @property
     def _reader(self):
         if not self.__reader:
-            self.__reader = self._socket.makefile('r')
+            self.__reader = self._socket.makefile('r', encoding='utf-8')
         return self.__reader
 
     @property
     def _writer(self):
         if not self.__writer:
-            self.__writer = self._socket.makefile('w')
+            self.__writer = self._socket.makefile('w', encoding='utf-8')
         return self.__writer
 
     def close(self):
@@ -678,7 +678,7 @@ class SearchClient(SonicClient, CommonCommandsMixin):
         """
         limit = "LIMIT({})".format(limit) if limit else ''
         word = quote_text(word)
-        return self._execute_command(
+        return self._execute_command_async(
             'SUGGEST', collection, bucket, word, limit)
 
 
