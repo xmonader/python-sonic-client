@@ -118,7 +118,7 @@ def _parse_protocol_version(text):
     return matches[0]
 
 
-def _parse_buffer_size(text):
+def _parse_buffer_size(text: str) -> int:
     """Extracts buffering from response message
 
     Arguments:
@@ -128,13 +128,13 @@ def _parse_buffer_size(text):
         ValueError -- Raised when s doesn't have buffering information
 
     Returns:
-        str -- buffering.
+        int -- buffer size.
     """
 
-    matches = re.findall("buffer\((\w+)\)", text)
+    matches = re.findall("buffer\(([0-9]+)\)", text)
     if not matches:
         raise ValueError("{} doesn't contain buffer(NUMBER)".format(text))
-    return matches[0]
+    return int(matches[0])
 
 
 def _get_async_response_id(text):
@@ -464,6 +464,7 @@ class SonicClient:
             str|object -- result of execution
         """
         active = self.get_active_connection()
+        self.bufsize = active.bufsize
         try:
             res = active._execute_command(cmd, *args)
         finally:
@@ -487,6 +488,33 @@ class SonicClient:
         finally:
             self.pool.release(active)
         return resp
+
+
+def split(text: str, size: int, sep:str=" "):
+    if sep != " ":
+        text = text.translate(str.maketrans(dict((a, " ") for a in sep)))
+    poz = 0
+    while poz < len(text):
+        chunk = text[poz:poz+size]
+        if len(chunk) < size: # this is the end
+            yield chunk
+            return
+        if (text[poz+size-1] != " ") and (text[poz+size] != " "):
+            x = chunk.rfind(" ")
+            if x != -1: # Can split on space
+                poz += x
+                yield chunk[:x]
+                continue
+        poz += size
+        yield chunk
+
+
+def test_split():
+    txt = "The lazy dog jump over the wizard, that's all."
+    groups = list(split(txt, 10, " ,;.:"))
+    print(groups)
+    assert len(groups) == 6
+
 
 class CommonCommandsMixin:
     """Mixin of the commands used by all sonic channels."""
@@ -533,8 +561,12 @@ class IngestClient(SonicClient, CommonCommandsMixin):
         """
 
         lang = "LANG({})".format(lang) if lang else ''
-        text = quote_text(text)
-        return self._execute_command("PUSH", collection, bucket, object, text, lang)
+        for group in split(text,
+                           self.bufsize - len("".join(["PUSH", collection, bucket])),
+                           ";.:,\n\r\t"):
+            text = quote_text(text)
+            resp = self._execute_command("PUSH", collection, bucket, object, text, lang)
+        return resp
 
     def pop(self, collection: str, bucket: str, object: str, text: str):
         """Pop search data from the index
@@ -732,6 +764,7 @@ def test_control():
 
 
 if __name__ == "__main__":
+    test_split()
     test_ingest()
     test_search()
     test_control()
